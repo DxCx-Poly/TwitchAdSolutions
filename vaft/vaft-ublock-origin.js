@@ -43,22 +43,14 @@ twitch-videoad.js text/javascript
             });
         }
     } catch (err) {}
-    //Send settings updates to worker.
-    window.addEventListener('message', (event) => {
-        if (event.source != window) {
-            return;
-        }
-        if (event.data.type && event.data.type == 'SetTwitchAdblockSettings' && event.data.settings) {
-            TwitchAdblockSettings = event.data.settings;
-        }
-    }, false);
     function declareOptions(scope) {
         scope.AdSignifier = 'stitched';
         scope.ClientID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
         scope.ClientVersion = 'null';
         scope.ClientSession = 'null';
         scope.PlayerType2 = 'embed'; //Source
-        scope.PlayerType3 = 'autoplay'; //360p
+        scope.PlayerType3 = 'site'; //Source
+        scope.PlayerType4 = 'autoplay'; //360p
         scope.CurrentChannelName = null;
         scope.UsherParams = null;
         scope.WasShowingAd = false;
@@ -68,30 +60,17 @@ twitch-videoad.js text/javascript
         scope.StreamInfosByUrl = [];
         scope.MainUrlByUrl = [];
         scope.EncodingCacheTimeout = 60000;
-        scope.DefaultProxyType = null;
-        scope.DefaultForcedQuality = null;
-        scope.DefaultProxyQuality = null;
         scope.ClientIntegrityHeader = null;
         scope.AuthorizationHeader = null;
     }
     declareOptions(window);
-    var TwitchAdblockSettings = {
-        BannerVisible: true,
-        ForcedQuality: null,
-        ProxyType: null,
-        ProxyQuality: null,
-    };
-    var twitchMainWorker = null;
+    var twitchWorkers = [];
     var adBlockDiv = null;
     var OriginalVideoPlayerQuality = null;
     var IsPlayerAutoQuality = null;
     const oldWorker = window.Worker;
     window.Worker = class Worker extends oldWorker {
         constructor(twitchBlobUrl) {
-            if (twitchMainWorker) {
-                super(twitchBlobUrl);
-                return;
-            }
             var jsURL = getWasmWorkerUrl(twitchBlobUrl);
             if (typeof jsURL !== 'string') {
                 super(twitchBlobUrl);
@@ -110,7 +89,6 @@ twitch-videoad.js text/javascript
                 ${tryNotifyTwitch.toString()}
                 ${parseAttributes.toString()}
                 declareOptions(self);
-                self.TwitchAdblockSettings = ${JSON.stringify(TwitchAdblockSettings)};
                 self.addEventListener('message', function(e) {
                     if (e.data.key == 'UpdateIsSquadStream') {
                         IsSquadStream = e.data.value;
@@ -132,12 +110,9 @@ twitch-videoad.js text/javascript
                 importScripts('${jsURL}');
             `;
             super(URL.createObjectURL(new Blob([newBlobStr])));
-            twitchMainWorker = this;
+            twitchWorkers.push(this);
             this.onmessage = function(e) {
                 if (e.data.key == 'ShowAdBlockBanner') {
-                    if (!TwitchAdblockSettings.BannerVisible) {
-                        return;
-                    }
                     if (adBlockDiv == null) {
                         adBlockDiv = getAdBlockDiv();
                     }
@@ -268,11 +243,11 @@ twitch-videoad.js text/javascript
         return req.responseText.split("'")[1];
     }
     function hookWorkerFetch() {
-        console.log('Twitch adblocker is enabled');
+        console.log('hookWorkerFetch');
         var realFetch = fetch;
         fetch = async function(url, options) {
             if (typeof url === 'string') {
-                if (url.includes('video-weaver')) {
+                if (url.endsWith('m3u8')) {
                     return new Promise(function(resolve, reject) {
                         var processAfter = async function(response) {
                             //Here we check the m3u8 for any ads and also try fallback player types if needed.
@@ -281,6 +256,9 @@ twitch-videoad.js text/javascript
                             weaverText = await processM3U8(url, responseText, realFetch, PlayerType2);
                             if (weaverText.includes(AdSignifier)) {
                                 weaverText = await processM3U8(url, responseText, realFetch, PlayerType3);
+                            }
+                            if (weaverText.includes(AdSignifier)) {
+                                weaverText = await processM3U8(url, responseText, realFetch, PlayerType4);
                             }
                             resolve(new Response(weaverText));
                         };
@@ -311,6 +289,7 @@ twitch-videoad.js text/javascript
                                     StreamInfos[channelName] = streamInfo = {};
                                 }
                                 streamInfo.ChannelName = channelName;
+                                streamInfo.RequestedAds = new Set();
                                 streamInfo.Urls = [];// xxx.m3u8 -> { Resolution: "284x160", FrameRate: 30.0 }
                                 streamInfo.EncodingsM3U8Cache = [];
                                 streamInfo.EncodingsM3U8 = encodingsM3u8;
@@ -412,9 +391,6 @@ twitch-videoad.js text/javascript
     }
     async function getStreamForResolution(streamInfo, resolutionInfo, encodingsM3u8, fallbackStreamStr, playerType, realFetch) {
         var qualityOverride = null;
-        if (playerType === 'proxy') {
-            qualityOverride = TwitchAdblockSettings.ProxyQuality ? TwitchAdblockSettings.ProxyQuality : DefaultProxyQuality;
-        }
         if (streamInfo.EncodingsM3U8Cache[playerType].Resolution != resolutionInfo.Resolution ||
             streamInfo.EncodingsM3U8Cache[playerType].RequestTime < Date.now() - EncodingCacheTimeout) {
             console.log(`Blocking ads (type:${playerType}, resolution:${resolutionInfo.Resolution}, frameRate:${resolutionInfo.FrameRate}, qualityOverride:${qualityOverride})`);
@@ -471,6 +447,21 @@ twitch-videoad.js text/javascript
             var isMidroll = textStr.includes('"MIDROLL"') || textStr.includes('"midroll"');
             //Reduces ad frequency. TODO: Reduce the number of requests. This is really spamming Twitch with requests.
             if (!isMidroll) {
+                if (playerType === PlayerType2) {
+                    var lines = textStr.replace('\r', '').split('\n');
+                    for (var i = 0; i < lines.length; i++) {
+                        var line = lines[i];
+                        if (line.startsWith('#EXTINF') && lines.length > i + 1) {
+                            if (!line.includes(',live') && !streamInfo.RequestedAds.has(lines[i + 1])) {
+                                // Only request one .ts file per .m3u8 request to avoid making too many requests
+                                //console.log('Fetch ad .ts file');
+                                streamInfo.RequestedAds.add(lines[i + 1]);
+                                fetch(lines[i + 1]).then((response)=>{response.blob()});
+                                break;
+                            }
+                        }
+                    }
+                }
                 try {
                     //tryNotifyTwitch(textStr);
                 } catch (err) {}
@@ -504,28 +495,6 @@ twitch-videoad.js text/javascript
                     Value: null,
                     Resolution: null
                 };
-            }
-            if (playerType === 'proxy') {
-                try {
-                    var proxyType = TwitchAdblockSettings.ProxyType ? TwitchAdblockSettings.ProxyType : DefaultProxyType;
-                    var encodingsM3u8Response = null;
-                    /*var tempUrl = stripUnusedParams(MainUrlByUrl[url]);
-                    const match = /(hls|vod)\/(.+?)$/gim.exec(tempUrl);*/
-                    switch (proxyType) {
-                        case 'TTV LOL':
-                            encodingsM3u8Response = await realFetch('https://api.ttv.lol/playlist/' + CurrentChannelName + '.m3u8%3Fallow_source%3Dtrue'/* + encodeURIComponent(match[2])*/, {headers: {'X-Donate-To': 'https://ttv.lol/donate'}});
-                            break;
-                        /*case 'Purple Adblock':// Broken...
-                            encodingsM3u8Response = await realFetch('https://eu1.jupter.ga/channel/' + CurrentChannelName);*/
-                        case 'Falan':// https://greasyfork.org/en/scripts/425139-twitch-ad-fix/code
-                            encodingsM3u8Response = await realFetch(atob('aHR0cHM6Ly9qaWdnbGUuYmV5cGF6YXJpZ3VydXN1LndvcmtlcnMuZGV2') + '/hls/' + CurrentChannelName + '.m3u8%3Fallow_source%3Dtrue'/* + encodeURIComponent(match[2])*/);
-                            break;
-                    }
-                    if (encodingsM3u8Response && encodingsM3u8Response.status === 200) {
-                        return getStreamForResolution(streamInfo, currentResolution, await encodingsM3u8Response.text(), textStr, playerType, realFetch);
-                    }
-                } catch (err) {}
-                return textStr;
             }
             var accessTokenResponse = await getAccessToken(CurrentChannelName, playerType);
             if (accessTokenResponse.status === 200) {
@@ -658,7 +627,7 @@ twitch-videoad.js text/javascript
     }
     function gqlRequest(body, realFetch) {
         if (ClientIntegrityHeader == null) {
-            console.warn('ClientIntegrityHeader is null');
+            //console.warn('ClientIntegrityHeader is null');
             //throw 'ClientIntegrityHeader is null';
         }
         var fetchFunc = realFetch ? realFetch : fetch;
@@ -704,10 +673,24 @@ twitch-videoad.js text/javascript
                 }
                 return null;
             }
-            var reactRootNode = null;
-            var rootNode = document.querySelector('#root');
-            if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
-                reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+            function findReactRootNode() {
+                var reactRootNode = null;
+                var rootNode = document.querySelector('#root');
+                if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
+                    reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+                }
+                if (reactRootNode == null) {
+                    var containerName = Object.keys(rootNode).find(x => x.startsWith('__reactContainer'));
+                    if (containerName != null) {
+                        reactRootNode = rootNode[containerName];
+                    }
+                }
+                return reactRootNode;
+            }
+            var reactRootNode = findReactRootNode();
+            if (!reactRootNode) {
+                console.log('Could not find react root');
+                return;
             }
             videoPlayer = findReactNode(reactRootNode, node => node.setPlayerActive && node.props && node.props.mediaPlayerInstance);
             videoPlayer = videoPlayer && videoPlayer.props && videoPlayer.props.mediaPlayerInstance ? videoPlayer.props.mediaPlayerInstance : null;
@@ -768,27 +751,23 @@ twitch-videoad.js text/javascript
             } catch (err) {}
         } catch (err) {}
     }
+    window.reloadTwitchPlayer = doTwitchPlayerTask;
     var localDeviceID = null;
     localDeviceID = window.localStorage.getItem('local_copy_unique_id');
+    function postTwitchWorkerMessage(key, value) {
+        twitchWorkers.forEach((worker) => {
+            worker.postMessage({key: key, value: value});
+        });
+    }
     function hookFetch() {
         var realFetch = window.fetch;
         window.fetch = function(url, init, ...args) {
             if (typeof url === 'string') {
                 //Check if squad stream.
                 if (window.location.pathname.includes('/squad')) {
-                    if (twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateIsSquadStream',
-                            value: true
-                        });
-                    }
+                    postTwitchWorkerMessage('UpdateIsSquadStream', true);
                 } else {
-                    if (twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateIsSquadStream',
-                            value: false
-                        });
-                    }
+                    postTwitchWorkerMessage('UpdateIsSquadStream', false);
                 }
                 if (url.includes('/access_token') || url.includes('gql')) {
                     //Device ID is used when notifying Twitch of ads.
@@ -803,39 +782,30 @@ twitch-videoad.js text/javascript
                         GQLDeviceID = localDeviceID.replace('"', '');
                         GQLDeviceID = GQLDeviceID.replace('"', '');
                     }
-                    if (GQLDeviceID && twitchMainWorker) {
+                    if (GQLDeviceID) {
                         if (typeof init.headers['X-Device-Id'] === 'string') {
                             init.headers['X-Device-Id'] = GQLDeviceID;
                         }
                         if (typeof init.headers['Device-ID'] === 'string') {
                             init.headers['Device-ID'] = GQLDeviceID;
                         }
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateDeviceId',
-                            value: GQLDeviceID
-                        });
+                        postTwitchWorkerMessage('UpdateDeviceId', GQLDeviceID);
                     }
                     //Client version is used in GQL requests.
                     var clientVersion = init.headers['Client-Version'];
                     if (clientVersion && typeof clientVersion == 'string') {
                         ClientVersion = clientVersion;
                     }
-                    if (ClientVersion && twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateClientVersion',
-                            value: ClientVersion
-                        });
+                    if (ClientVersion) {
+                        postTwitchWorkerMessage('UpdateClientVersion', ClientVersion);
                     }
                     //Client session is used in GQL requests.
                     var clientSession = init.headers['Client-Session-Id'];
                     if (clientSession && typeof clientSession == 'string') {
                         ClientSession = clientSession;
                     }
-                    if (ClientSession && twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateClientSession',
-                            value: ClientSession
-                        });
+                    if (ClientSession) {
+                        postTwitchWorkerMessage('UpdateClientSession', ClientSession);
                     }
                     //Client ID is used in GQL requests.
                     if (url.includes('gql') && init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
@@ -848,24 +818,19 @@ twitch-videoad.js text/javascript
                                 ClientID = clientId;
                             }
                         }
-                        if (ClientID && twitchMainWorker) {
-                            twitchMainWorker.postMessage({
-                                key: 'UpdateClientId',
-                                value: ClientID
-                            });
+                        if (ClientID) {
+                            postTwitchWorkerMessage('UpdateClientId', ClientID);
                         }
                         //Client integrity header
                         ClientIntegrityHeader = init.headers['Client-Integrity'];
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateClientIntegrityHeader',
-                            value: init.headers['Client-Integrity']
-                        });
+                        if (ClientIntegrityHeader) {
+                            postTwitchWorkerMessage('UpdateClientIntegrityHeader', ClientIntegrityHeader);
+                        }
                         //Authorization header
                         AuthorizationHeader = init.headers['Authorization'];
-                        twitchMainWorker.postMessage({
-                            key: 'UpdateAuthorizationHeader',
-                            value: init.headers['Authorization']
-                        });
+                        if (AuthorizationHeader) {
+                            postTwitchWorkerMessage('UpdateAuthorizationHeader', AuthorizationHeader);
+                        }
                     }
                     //To prevent pause/resume loop for mid-rolls.
                     if (url.includes('gql') && init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken') && init.body.includes('picture-by-picture')) {

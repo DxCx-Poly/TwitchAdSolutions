@@ -34,14 +34,10 @@ twitch-videoad.js text/javascript
         scope.AuthorizationHeader = null;
     }
     declareOptions(window);
-    var twitchMainWorker = null;
+    var twitchWorkers = [];
     const oldWorker = window.Worker;
     window.Worker = class Worker extends oldWorker {
         constructor(twitchBlobUrl) {
-            if (twitchMainWorker) {
-                super(twitchBlobUrl);
-                return;
-            }
             var jsURL = getWasmWorkerUrl(twitchBlobUrl);
             if (typeof jsURL !== 'string') {
                 super(twitchBlobUrl);
@@ -71,7 +67,7 @@ twitch-videoad.js text/javascript
                 importScripts('${jsURL}');
             `
             super(URL.createObjectURL(new Blob([newBlobStr])));
-            twitchMainWorker = this;
+            twitchWorkers.push(this);
             this.onmessage = function(e) {
                 // NOTE: Removed adDiv caching as '.video-player' can change between streams?
                 if (e.data.key == 'UboShowAdBanner') {
@@ -152,11 +148,27 @@ twitch-videoad.js text/javascript
                 var streamM3u8Response = await realFetch(streamM3u8Url);
                 if (streamM3u8Response.status == 200) {
                     var streamM3u8 = await streamM3u8Response.text();
-                    if (streamM3u8 != null && !streamM3u8.includes(AD_SIGNIFIER)) {
-                        console.log('No more ads on main stream. Triggering player reload to go back to main stream...');
-                        streamInfo.UseBackupStream = false;
-                        postMessage({key:'UboHideAdBanner'});
-                        postMessage({key:'UboReloadPlayer'});
+                    if (streamM3u8 != null) {
+                        if (!streamM3u8.includes(AD_SIGNIFIER)) {
+                            console.log('No more ads on main stream. Triggering player reload to go back to main stream...');
+                            streamInfo.UseBackupStream = false;
+                            postMessage({key:'UboHideAdBanner'});
+                            postMessage({key:'UboReloadPlayer'});
+                        } else if (!streamM3u8.includes('"MIDROLL"') && !streamM3u8.includes('"midroll"')) {
+                            var lines = streamM3u8.replace('\r', '').split('\n');
+                            for (var i = 0; i < lines.length; i++) {
+                                var line = lines[i];
+                                if (line.startsWith('#EXTINF') && lines.length > i + 1) {
+                                    if (!line.includes(LIVE_SIGNIFIER) && !streamInfo.RequestedAds.has(lines[i + 1])) {
+                                        // Only request one .ts file per .m3u8 request to avoid making too many requests
+                                        //console.log('Fetch ad .ts file');
+                                        streamInfo.RequestedAds.add(lines[i + 1]);
+                                        fetch(lines[i + 1]).then((response)=>{response.blob()});
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -211,6 +223,7 @@ twitch-videoad.js text/javascript
                             var useBackupStream = false;
                             if (streamInfo == null || streamInfo.Encodings == null || streamInfo.BackupEncodings == null) {
                                 StreamInfos[channelName] = streamInfo = {
+                                    RequestedAds: new Set(),
                                     Encodings: null,
                                     BackupEncodings: null,
                                     IsMidroll: false,
@@ -340,7 +353,7 @@ twitch-videoad.js text/javascript
     }
     function gqlRequest(body, realFetch) {
         if (ClientIntegrityHeader == null) {
-            console.warn('ClientIntegrityHeader is null');
+            //console.warn('ClientIntegrityHeader is null');
             //throw 'ClientIntegrityHeader is null';
         }
         var fetchFunc = realFetch ? realFetch : fetch;
@@ -426,6 +439,11 @@ twitch-videoad.js text/javascript
             return 0;
         }
     }
+    function postTwitchWorkerMessage(key, value) {
+        twitchWorkers.forEach((worker) => {
+            worker.postMessage({key: key, value: value});
+        });
+    }
     function hookFetch() {
         var realFetch = window.fetch;
         window.fetch = function(url, init, ...args) {
@@ -438,11 +456,8 @@ twitch-videoad.js text/javascript
                     if (typeof deviceId === 'string') {
                         gql_device_id = deviceId;
                     }
-                    if (gql_device_id && twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UboUpdateDeviceId',
-                            value: gql_device_id
-                        });
+                    if (gql_device_id) {
+                        postTwitchWorkerMessage('UboUpdateDeviceId', gql_device_id);
                     }
                     if (typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
                         if (OPT_ACCESS_TOKEN_PLAYER_TYPE) {
@@ -466,17 +481,15 @@ twitch-videoad.js text/javascript
                         }
                         if (typeof init.headers['Client-Integrity'] === 'string') {
                             ClientIntegrityHeader = init.headers['Client-Integrity'];
-                            twitchMainWorker.postMessage({
-                                key: 'UpdateClientIntegrityHeader',
-                                value: init.headers['Client-Integrity']
-                            });
+                            if (ClientIntegrityHeader) {
+                                postTwitchWorkerMessage('UpdateClientIntegrityHeader', init.headers['Client-Integrity']);
+                            }
                         }
                         if (typeof init.headers['Authorization'] === 'string') {
                             AuthorizationHeader = init.headers['Authorization'];
-                            twitchMainWorker.postMessage({
-                                key: 'UpdateAuthorizationHeader',
-                                value: init.headers['Authorization']
-                            });
+                            if (AuthorizationHeader) {
+                                postTwitchWorkerMessage('UpdateAuthorizationHeader', init.headers['Authorization']);
+                            }
                         }
                     }
                 }
@@ -502,11 +515,21 @@ twitch-videoad.js text/javascript
             }
             return null;
         }
-        var reactRootNode = null;
-        var rootNode = document.querySelector('#root');
-        if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
-            reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+        function findReactRootNode() {
+            var reactRootNode = null;
+            var rootNode = document.querySelector('#root');
+            if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
+                reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+            }
+            if (reactRootNode == null) {
+                var containerName = Object.keys(rootNode).find(x => x.startsWith('__reactContainer'));
+                if (containerName != null) {
+                    reactRootNode = rootNode[containerName];
+                }
+            }
+            return reactRootNode;
         }
+        var reactRootNode = findReactRootNode();
         if (!reactRootNode) {
             console.log('Could not find react root');
             return;
@@ -522,7 +545,7 @@ twitch-videoad.js text/javascript
             console.log('Could not find player state');
             return;
         }
-        if (player.paused) {
+        if (player.paused || player.core?.paused) {
             return;
         }
         if (isSeek) {
